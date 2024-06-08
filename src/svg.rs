@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use bevy::{
     asset::{Asset, Handle},
@@ -14,7 +14,7 @@ use lyon_tessellation::{math::Point, FillTessellator, StrokeTessellator};
 use svgtypes::ViewBox;
 use usvg::{
     tiny_skia_path::{PathSegment, PathSegmentsIter},
-    NodeExt, TreeParsing, TreeTextToPath,
+    Node,
 };
 
 use crate::{loader::FileSvgError, render::tessellation, Convert};
@@ -61,18 +61,17 @@ impl Svg {
         path: impl Into<PathBuf>,
         fonts: Option<impl Into<PathBuf>>,
     ) -> Result<Svg, FileSvgError> {
-        let mut svg_tree =
-            usvg::Tree::from_data(&bytes, &usvg::Options::default()).map_err(|err| {
-                FileSvgError {
-                    error: err.into(),
-                    path: format!("{}", path.into().display()),
-                }
-            })?;
+        let mut options = usvg::Options::default();
 
         let mut fontdb = usvg::fontdb::Database::default();
         fontdb.load_system_fonts();
         fontdb.load_fonts_dir(fonts.map(|p| p.into()).unwrap_or("./assets".into()));
-        svg_tree.convert_text(&fontdb);
+
+        options.fontdb = Arc::new(fontdb);
+        let svg_tree = usvg::Tree::from_data(&bytes, &options).map_err(|err| FileSvgError {
+            error: err.into(),
+            path: format!("{}", path.into().display()),
+        })?;
 
         Ok(Svg::from_tree(svg_tree))
     }
@@ -88,19 +87,18 @@ impl Svg {
     }
 
     pub(crate) fn from_tree(tree: usvg::Tree) -> Svg {
-        let view_box = tree.view_box;
-        let size = tree.size;
+        let size = tree.size();
         let mut descriptors = Vec::new();
 
-        for node in tree.root.descendants() {
-            match &*node.borrow() {
-                usvg::NodeKind::Path(ref path) => {
+        for node in tree.root().children() {
+            match node {
+                Node::Path(ref path) => {
                     let abs_transform = node.abs_transform().convert();
 
-                    if let Some(fill) = &path.fill {
-                        let color = match fill.paint {
+                    if let Some(fill) = &path.fill() {
+                        let color = match fill.paint() {
                             usvg::Paint::Color(c) => {
-                                Color::rgba_u8(c.red, c.green, c.blue, fill.opacity.to_u8())
+                                Color::rgba_u8(c.red, c.green, c.blue, fill.opacity().to_u8())
                             }
                             _ => Color::default(),
                         };
@@ -113,7 +111,7 @@ impl Svg {
                         });
                     }
 
-                    if let Some(stroke) = &path.stroke {
+                    if let Some(stroke) = &path.stroke() {
                         let (color, draw_type) = stroke.convert();
 
                         descriptors.alloc().init(PathDescriptor {
@@ -132,10 +130,10 @@ impl Svg {
             name: Default::default(),
             size: Vec2::new(size.width(), size.height()),
             view_box: ViewBox {
-                x: view_box.rect.x() as f64,
-                y: view_box.rect.y() as f64,
-                w: view_box.rect.width() as f64,
-                h: view_box.rect.height() as f64,
+                x: 100.0,
+                y: 100.0,
+                w: size.width() as f64,
+                h: size.height() as f64,
             },
             paths: descriptors,
             mesh: Default::default(),
@@ -280,9 +278,9 @@ impl Convert<Transform> for usvg::tiny_skia_path::Transform {
 
 impl<'iter> Convert<PathConvIter<'iter>> for &'iter usvg::Path {
     fn convert(self) -> PathConvIter<'iter> {
-        let (scale_x, scale_y) = self.transform.get_scale();
+        let (scale_x, scale_y) = self.abs_transform().get_scale();
         return PathConvIter {
-            iter: self.data.segments(),
+            iter: self.data().segments(),
             first: Point::new(0.0, 0.0),
             prev: Point::new(0.0, 0.0),
             deferred: None,
@@ -295,19 +293,19 @@ impl<'iter> Convert<PathConvIter<'iter>> for &'iter usvg::Path {
 impl Convert<(Color, DrawType)> for &usvg::Stroke {
     #[inline]
     fn convert(self) -> (Color, DrawType) {
-        let color = match self.paint {
-            usvg::Paint::Color(c) => Color::rgba_u8(c.red, c.green, c.blue, self.opacity.to_u8()),
+        let color = match self.paint() {
+            usvg::Paint::Color(c) => Color::rgba_u8(c.red, c.green, c.blue, self.opacity().to_u8()),
             usvg::Paint::LinearGradient(_)
             | usvg::Paint::RadialGradient(_)
             | usvg::Paint::Pattern(_) => Color::default(),
         };
 
-        let linecap = match self.linecap {
+        let linecap = match self.linecap() {
             usvg::LineCap::Butt => lyon_tessellation::LineCap::Butt,
             usvg::LineCap::Square => lyon_tessellation::LineCap::Square,
             usvg::LineCap::Round => lyon_tessellation::LineCap::Round,
         };
-        let linejoin = match self.linejoin {
+        let linejoin = match self.linejoin() {
             usvg::LineJoin::Miter => lyon_tessellation::LineJoin::Miter,
             usvg::LineJoin::MiterClip => lyon_tessellation::LineJoin::MiterClip,
             usvg::LineJoin::Bevel => lyon_tessellation::LineJoin::Bevel,
@@ -315,7 +313,7 @@ impl Convert<(Color, DrawType)> for &usvg::Stroke {
         };
 
         let opt = lyon_tessellation::StrokeOptions::tolerance(0.01)
-            .with_line_width(self.width.get() as f32)
+            .with_line_width(self.width().get() as f32)
             .with_line_cap(linecap)
             .with_line_join(linejoin);
 
